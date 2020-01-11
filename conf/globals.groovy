@@ -1,3 +1,6 @@
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.hubspot.jinjava.Jinjava
+import com.hubspot.jinjava.lib.fn.ELFunctionDefinition
 import com.pontusvision.utils.ElasticSearchHelper
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -14,6 +17,12 @@ import org.apache.tinkerpop.gremlin.structure.io.graphson.GraphSONVersion
 import org.janusgraph.core.*
 import org.janusgraph.core.schema.*
 import org.janusgraph.graphdb.types.vertices.JanusGraphSchemaVertex
+import org.jfree.chart.ChartFactory
+import org.jfree.chart.ChartUtils
+import org.jfree.chart.JFreeChart
+import org.jfree.chart.StandardChartTheme
+import org.jfree.chart.plot.PlotOrientation
+import org.jfree.data.category.DefaultCategoryDataset
 
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -949,7 +958,7 @@ class Schema {
 
 }
 
-def renderReportInText(long pg_id, String reportType = 'SAR Read', GraphTraversalSource g = g) {
+def renderReportInTextPt(long pg_id, String reportType = 'DSAR', GraphTraversalSource g = g) {
   def template = g.V().has('Object.Notification_Templates.Types', eq('Person.Natural'))
     .has('Object.Notification_Templates.Label', eq(reportType))
     .values('Object.Notification_Templates.Text').next() as String
@@ -971,72 +980,552 @@ def renderReportInText(long pg_id, String reportType = 'SAR Read', GraphTraversa
     allData.put('context', context);
     allData.put('connected_data', neighbours);
 
-    com.hubspot.jinjava.Jinjava jinJava = new com.hubspot.jinjava.Jinjava();
-    return jinJava.render(new String(template.decodeBase64()), allData).toString();
+
+    return PontusJ2ReportingFunctions.jinJava.render(new String(template.decodeBase64()), allData).toString();
   }
   return "Failed to render data"
 }
 
+
+def renderReportInText(long pg_id, String reportType = 'SAR Read', GraphTraversalSource g = g) {
+
+  if (new File("conf/i18n_pt_translation.json").exists()) {
+    return renderReportInTextPt(pg_id, reportType, g);
+  }
+
+  def template = g.V().has('Object.Notification_Templates.Types', eq('Person.Natural'))
+    .has('Object.Notification_Templates.Label', eq(reportType))
+    .values('Object.Notification_Templates.Text').next() as String
+  if (template) {
+
+    // def template = g.V().has('Object.Notification_Templates.Types',eq(label)).next() as String
+    def context = g.V(pg_id).valueMap()[0].collectEntries { key, val ->
+      [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
+    };
+
+    def neighbours = g.V(pg_id).both().valueMap().toList().collect { item ->
+      item.collectEntries { key, val ->
+        [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
+      }
+    };
+
+    def allData = new HashMap<>();
+
+    allData.put('context', context);
+    allData.put('connected_data', neighbours);
+
+    return PontusJ2ReportingFunctions.jinJava.render(new String(template.decodeBase64()), allData).toString();
+  }
+  return "Failed to render data"
+}
+
+
+public class PontusJ2ReportingFunctions {
+
+  public static def getProbabilityOfPossibleMatches(Long startVertexId, Map<String, Double> weightsPerVertex) {
+
+    String vertType = g.V(startVertexId).label().next();
+
+    def weightedScores = new HashMap<Long, Double>();
+    def labelsForMatch = new HashMap<Long, StringBuffer>();
+
+    Double totalScore = 0;
+
+    g.V(startVertexId).both().label().each { String label ->
+      totalScore += weightsPerVertex.get(label, new Double(0));
+    }
+
+    g.V(startVertexId)
+      .both().bothE()
+      .filter(bothV()
+        .has("Metadata.Type.${vertType}", eq(vertType))
+        .id().not(is(startVertexId))).path()
+      .each { path ->
+
+        path.objects().each { obj ->
+          if (obj instanceof Edge) {
+
+            int counter = 0;
+            obj.bothVertices().each { v ->
+
+              if (vertType == v.label()) {
+                Long currVid = v.id() as Long;
+                def currScore = weightedScores.get(currVid, new Double(0));
+                // def listOfPaths = perUserVertices.computeIfAbsent(v.id(), s -> [] )
+                int vertIdx = (counter == 0) ? 1 : 0
+                String label = obj.bothVertices().get(vertIdx).label()
+                Double scoreForLabel = weightsPerVertex.get(label, new Double(0));
+
+                if (scoreForLabel > 0) {
+                  StringBuffer currPath = labelsForMatch.get(currVid, new StringBuffer());
+                  if (currPath.length() > 0) {
+                    currPath.append(', ')
+                  }
+                  currPath.append(translate(label.replaceAll("[_|\\.]", " ")));
+                  labelsForMatch.put(currVid, currPath);
+                }
+                currScore += scoreForLabel / totalScore;
+                weightedScores.put(currVid, currScore);
+
+              }
+              counter++;
+            }
+          }
+          // }
+        }
+      }
+
+
+    return [weightedScores, labelsForMatch];
+
+  }
+
+  public static GraphTraversalSource g;
+  public static Jinjava jinJava;
+
+  static{
+    PontusJ2ReportingFunctions.jinJava = new Jinjava();
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "getChart",
+      PontusJ2ReportingFunctions.class, "getChart"));
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "possibleMatches",
+      PontusJ2ReportingFunctions.class, "possibleMatches", String.class, String.class));
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "context",
+      PontusJ2ReportingFunctions.class, "context", String.class));
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "connected_data",
+      PontusJ2ReportingFunctions.class, "neighbours", String.class));
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "htmlTableCustomHeader",
+      PontusJ2ReportingFunctions.class, "htmlTableCustomHeader", Map.class, String.class, String.class));
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "htmlRows",
+      PontusJ2ReportingFunctions.class, "htmlRows", Map.class, String.class));
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "htmlTable",
+      PontusJ2ReportingFunctions.class, "htmlTable", Map.class));
+    PontusJ2ReportingFunctions. jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "jsonToHtmlTable",
+      PontusJ2ReportingFunctions.class, "jsonToHtmlTable", String.class));
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "jsonToMap",
+      PontusJ2ReportingFunctions.class, "jsonToMap", String.class));
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "businessRulesTable",
+      PontusJ2ReportingFunctions.class, "businessRulesTable", String.class));
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "getDataSourcesForLawfulBasis",
+      PontusJ2ReportingFunctions.class, "getDataSourcesForLawfulBasis", String.class));
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "getDeptForDataSources",
+      PontusJ2ReportingFunctions.class, "getDeptForDataSources", String.class));
+
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "getNumNaturalPersonForLawfulBasis",
+      PontusJ2ReportingFunctions.class, "getNumNaturalPersonForLawfulBasis", String.class));
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "getNumNaturalPersonForPIA",
+      PontusJ2ReportingFunctions.class, "getNumNaturalPersonForPIA", String.class));
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "getNumSensitiveInfoForPIA",
+      PontusJ2ReportingFunctions.class, "getNumSensitiveInfoForPIA", String.class));
+
+    PontusJ2ReportingFunctions.jinJava.getGlobalContext().registerFunction(new ELFunctionDefinition("pv", "t",
+      PontusJ2ReportingFunctions.class, "translate", String.class));
+
+
+  }
+
+  public static Map<Map<String, String>, Double> possibleMatchesMap(String pg_id, Map<String, Double> weightsPerVertex) {
+    def (Map<Long, Double> probs, Map<Long, StringBuffer> labelsForMatch) = getProbabilityOfPossibleMatches(Long.parseLong(pg_id), weightsPerVertex);
+
+    Map<Map<String, String>, Double> retVal = new HashMap<>();
+    probs.each { vid, prob ->
+      Map<String, String> context = g.V(vid).valueMap()[0].collectEntries { key, val ->
+        [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
+      };
+      context.put('Labels_For_Match', labelsForMatch.get(vid).toString());
+      retVal.put(context, prob);
+    }
+
+    return retVal;
+  }
+
+  public static Map<Map<String, String>, Double> possibleMatches(String pg_id, String weightsPerServer) {
+
+
+
+    Map<String, Double> weights =
+      new ObjectMapper().readValue(weightsPerServer, Map.class);
+
+    return possibleMatchesMap(pg_id, weights);
+  }
+
+  public static Map<String, String> context(String pg_id) {
+    def context = g.V(Long.parseLong(pg_id)).valueMap(true)[0].collectEntries { key, val ->
+      [key.toString().replaceAll('[.]', '_'), val.toString() - '[' - ']']
+    };
+    return context;
+  }
+
+  public static List<Map<String, String>> neighbours(String pg_id) {
+    def neighbours = g.V(Long.parseLong(pg_id)).both().valueMap(true).toList().collect { item ->
+      item.collectEntries { key, val ->
+        [key.toString().replaceAll('[.]', '_'), val.toString() - '[' - ']']
+      }
+    };
+
+    return neighbours;
+
+  }
+
+  public static String htmlTableCustomHeader(Map<String, String> map, String tableHeader, String tableFooter) {
+    StringBuilder htmlBuilder = new StringBuilder();
+    htmlBuilder.append(tableHeader);
+
+    htmlBuilder.append(htmlRows(map))
+    htmlBuilder.append(tableFooter);
+
+    return htmlBuilder.toString();
+  }
+
+  public static String htmlRows(Map<String, String> map, String rowsCss = "border: 1px solid #dddddd;text-align: left;padding: 8px;") {
+    StringBuilder htmlBuilder = new StringBuilder();
+    for (Map.Entry<String, String> entry : map.entrySet()) {
+      htmlBuilder.append(String.format("<tr style='${rowsCss}'><td style='${rowsCss}'>%s</td><td style='${rowsCss}'>%s</td></tr>\n",
+        translate(entry.getKey().replaceAll("_", " ")), entry.getValue()));
+    }
+
+    return htmlBuilder.toString();
+  }
+
+  public static String htmlTable(Map<String, String> map) {
+    htmlTableCustomHeader(map,
+      "<table style='margin: 5px'><tr style='border: 1px solid #dddddd;text-align: left;padding: 8px;'><th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>" +
+        translate("Name") +
+        "</th><th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>" +
+        translate("Value") +
+        "</th></tr>",
+      "</table>");
+  }
+
+  public static String jsonToHtmlTable(String json) {
+    Map<String, String> jsonMap =
+      new ObjectMapper().readValue(json, Map.class);
+
+    htmlTableCustomHeader(jsonMap,
+      "<table style='margin: 5px'><tr style='border: 1px solid #dddddd;text-align: left;padding: 8px;'><th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>Name</th><th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>Value</th></tr>",
+      "</table>");
+  }
+
+  public static Map jsonToMap(String json) {
+    return new ObjectMapper().readValue(json, Map.class);
+
+  }
+
+
+  public static List<Map<String, String>> getDeptForDataSources(String dataSourceId) {
+    return g.V(Long.parseLong(dataSourceId))
+      .in('Has_Privacy_Impact_Assessment')
+      .filter(label().is('Object.Data_Source'))
+      .out('Has_Ingestion_Event')
+      .out('Has_Ingestion_Event')
+      .in('Has_Ingestion_Event')
+      .filter(label().is('Person.Natural'))
+      .valueMap(true)
+      .toList().collect({ item ->
+//      .collect { item ->
+      item.collectEntries({ key, val ->
+        [key.toString().replaceAll('[.]', '_'), val.toString() - '[' - ']']
+      })
+    } as Closure<Map<String, String>>);
+  }
+
+  public static List<Map<String, String>> getDataSourcesForLawfulBasis(String lawfulBasisId) {
+    def retVal = g.V(Long.parseLong(lawfulBasisId))
+      .in()
+      .in()
+      .has('Metadata.Type.Object.Privacy_Impact_Assessment', P.eq('Object.Privacy_Impact_Assessment'))
+      .in()
+      .has('Metadata.Type.Object.Data_Source', P.eq('Object.Data_Source'))
+      .valueMap(true).toList().collect { item ->
+      item.collectEntries { key, val ->
+        [key.toString().replaceAll('[.]', '_'), val.toString() - '[' - ']']
+      }
+    };
+
+    return retVal as List<Map<String, String>>;
+
+  }
+
+
+  public static Long getNumNaturalPersonForLawfulBasis(String lawfulBasisId) {
+    return g.V(Long.parseLong(lawfulBasisId))
+      .in()
+      .in()
+      .has('Metadata.Type.Object.Privacy_Impact_Assessment', P.eq('Object.Privacy_Impact_Assessment'))
+      .both()
+      .has('Metadata.Type.Object.Privacy_Notice', P.eq('Object.Privacy_Notice'))
+      .in()
+      .has('Metadata.Type.Event.Consent', P.eq('Event.Consent'))
+      .in()
+      .dedup()
+      .count()
+      .next();
+  }
+
+  public static Long getNumNaturalPersonForPIA(String piaId) {
+    return g.V(Long.parseLong(piaId))
+      .in('Has_Privacy_Impact_Assessment')
+      .filter(has('Metadata.Type.Object.Data_Source', P.eq('Object.Data_Source')))
+      .out('Has_Ingestion_Event')
+      .out('Has_Ingestion_Event')
+      .in('Has_Ingestion_Event')
+      .filter(has('Metadata.Type.Person.Natural', P.eq('Person.Natural')))
+      .count()
+      .next();
+
+
+  }
+
+  public static Long getNumSensitiveInfoForPIA(String piaId) {
+    return g.V(Long.parseLong(piaId))
+      .in('Has_Privacy_Impact_Assessment')
+      .filter(label().is('Object.Data_Source'))
+      .out('Has_Ingestion_Event')
+      .out('Has_Ingestion_Event')
+      .both('Has_Ingestion_Event')
+      .filter(has('Metadata.Type.Object.Sensitive_Data', P.eq('Object.Sensitive_Data')))
+      .count()
+      .next()
+
+  }
+
+  public static String businessRulesTable(String json) {
+
+
+    StringBuffer sb = new StringBuffer("<table style='margin: 2px; padding: 5px;'>")
+      .append("<tr style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+      .append("<th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>").append(translate("Name")).append("</th>")
+      .append("<th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>").append(translate("Match Weight")).append("</th>")
+      .append("<th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>").append(translate("Exclude From Search")).append("</th>")
+      .append("<th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>").append(translate("Exclude From Subsequence Search")).append("</th>")
+      .append("<th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>").append(translate("Exclude From Update")).append("</th>")
+      .append("<th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>").append(translate("Operation")).append("</th>")
+      .append("<th style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>").append(translate("Value")).append("</th>")
+      .append("</tr>");
+
+    Map br = jsonToMap(json);
+
+//    System.out.println('Before loop');
+
+    br.each { key, map ->
+      sb.append("<tr style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+
+      def innerMap = map[0];
+
+//      System.out.println("key = ${key}, map[0] = ${innerMap} map.size() = ${map.size()}; map[0].size = ${innerMap.size()}; ${map.class} innerMap.class = ${innerMap.class}");
+
+//      innerMap.each { it ->
+//        System.out.println("it = ${it}; it.class = ${it.class}");
+//        System.out.println("it.key = ${it.key}; it.val = ${it.value}");
+//      }
+//
+      String mainValue = null;
+      innerMap.each { entry ->
+        if (entry.key != 'matchWeight' && entry.key != 'excludeFromSearch' &&
+          entry.key != 'excludeFromSubsequenceSearch' && entry.key != 'excludeFromUpdate' &&
+          entry.key != 'operator') {
+          sb.append("<td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+            .append(entry.key.toString())
+            .append("</td>")
+          mainValue = entry.value.toString();
+
+        }
+      }
+
+//      System.out.println("innerMap.get('matchWeight' = ${innerMap.get('matchWeight')}");
+//      System.out.println("innerMap.get('excludeFromSearch' = ${innerMap.get('excludeFromSearch')}");
+//      System.out.println("innerMap.get('excludeFromSubsequenceSearch' = ${innerMap.get('excludeFromSubsequenceSearch')}");
+//      System.out.println("innerMap.get('excludeFromUpdate' = ${innerMap.get('excludeFromUpdate')}");
+//      System.out.println("innerMap.get('operator' = ${innerMap.get('operator')}");
+
+      sb.append("<td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+        .append(innerMap.get('matchWeight'))
+        .append("</td>")
+
+        .append("<td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+        .append(innerMap.get('excludeFromSearch'))
+        .append("</td>")
+
+        .append("<td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+        .append(innerMap.get('excludeFromSubsequenceSearch'))
+        .append("</td>")
+
+        .append("<td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+        .append(innerMap.get('excludeFromUpdate'))
+        .append("</td>")
+
+        .append("<td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+        .append(innerMap.get('operator'))
+        .append("</td>")
+
+        .append("<td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>")
+        .append(mainValue)
+        .append("</td>")
+
+
+      sb.append("</tr>")
+    }
+
+    sb.append('</table>')
+
+//    {{  "<tr style='border: 1px solid #dddddd;text-align: left;padding: 8px;'><td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>%s</td><td style='border: 1px solid #dddddd;text-align: left;padding: 8px;'>%s</td>" | format (c.key , c.value )}}
+
+    return sb.toString();
+
+  }
+
+  public static Long getNumDataSourcesForPIA(String id) {
+    return g.V(Long.parseLong(id)).both().has('Metadata.Type.Object.Data_Source', P.eq('Object.Data_Source')).id().count().next()
+  }
+
+  public static JsonSlurper ptDictionarySlurper;
+
+  def static ptDictionary;
+  static {
+    ptDictionarySlurper = new JsonSlurper();
+    try {
+      def inputFile = new File("conf/i18n_pt_translation.json")
+
+      ptDictionary = ptDictionarySlurper.parse(inputFile.text.toCharArray());
+
+    }
+    catch (Throwable t) {
+      System.err.println("failed to load conf/i18n_pt_translation.json: " + t.toString());
+    }
+
+  }
+
+  public static String getChart() {
+    try {
+
+      /* Step - 1: Define the data for the bar chart  */
+      DefaultCategoryDataset dataset = new DefaultCategoryDataset();
+      dataset.addValue(34, "Q1", "Rome");
+      dataset.addValue(45, "Q1", "Cairo");
+      dataset.addValue(22, "Q2", "Rome");
+      dataset.addValue(12, "Q2", "Cairo");
+      dataset.addValue(56, "Q3", "Rome");
+      dataset.addValue(98, "Q3", "Cairo");
+      dataset.addValue(2, "Q4", "Rome");
+      dataset.addValue(15, "Q4", "Cairo");
+
+      ChartFactory.setChartTheme(StandardChartTheme.createDarknessTheme());
+      /* Step -2:Define the JFreeChart object to create bar chart */
+      JFreeChart barChart = ChartFactory.createBarChart(
+        "CountryVsSales - Bar Chart",
+        "Country",
+        "Sales",
+        dataset,
+        PlotOrientation.VERTICAL, true, true, false);
+
+      /* Step -3: Write the output as PNG file with bar chart information */
+      int width = 640; /* Width of the image */
+      int height = 480; /* Height of the image */
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+
+      ChartUtils.writeChartAsPNG(out, barChart, width, height);
+
+
+      out.flush();
+
+      return new String (Base64.mimeEncoder.encode(out.toByteArray()));
+
+    }
+    catch (Exception i)
+    {
+      return i.toString();
+
+    }
+
+  }
+
+  public static String translate(String strToTranslate) {
+    if (ptDictionary) {
+      String retVal = ptDictionary.get(strToTranslate);
+      if (!retVal) {
+        System.err.println("failed to find translation conf/i18n_pt_translation.json: " + strToTranslate);
+        return strToTranslate;
+      } else {
+        return retVal;
+      }
+    }
+    return strToTranslate;
+  }
+}
+
+
 def renderReportInBase64(long pg_id, String pg_templateTextInBase64, GraphTraversalSource g = g) {
 
-  def context = g.V(pg_id).valueMap()[0].collectEntries { key, val ->
-    [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
-  };
-
-  def neighbours = g.V(pg_id).both().valueMap().toList().collect { item ->
-    item.collectEntries { key, val ->
-      [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
-    }
-  };
-
-
-  def impactedServers = g.V(pg_id)
-    .both()
-    .has("Metadata.Type.Object.AWS_Instance", P.eq('Object.AWS_Instance'))
-    .valueMap().toList().collect { item ->
-    item.collectEntries { key, val ->
-      [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
-    }
-  };
-
-
-  GraphTraversal impactedDataSourcesTrav = g.V(pg_id)
-    .both().has("Metadata.Type.Object.AWS_Instance", P.eq('Object.AWS_Instance'))
-    .bothE('Runs_On').outV().dedup()
-
-  GraphTraversal dsTravClone = impactedDataSourcesTrav.clone()
-
-  def impactedDataSources = impactedDataSourcesTrav.valueMap().toList().collect { item ->
-    item.collectEntries { key, val ->
-      [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
-    }
-  };
-
-  def impactedPeople = dsTravClone
-    .out("Has_Ingestion_Event")
-    .out("Has_Ingestion_Event")
-    .in("Has_Ingestion_Event")
-    .has("Metadata.Type.Person.Natural", P.eq('Person.Natural'))
-    .valueMap()
-    .toList()
-    .collect { item ->
-    item.collectEntries { key, val ->
-      [key.replaceAll('[.]', '_'), val.toString() - '[' - ']']
-    }
-  };
-
+  String vertType = g.V(pg_id).label().next();
   def allData = new HashMap<>();
+
+
+  def context = g.V(pg_id).valueMap(true)[0].collectEntries { key, val ->
+    [key.toString().replaceAll('[.]', '_'), val.toString().startsWith('[') ? val.toString().substring(1, val.toString().length() - 1) : val.toString()]
+  };
+
+  def neighbours = g.V(pg_id).both().valueMap(true).toList().collect { item ->
+    item.collectEntries { key, val ->
+      [key.toString().replaceAll('[.]', '_'), val.toString().startsWith('[') ? val.toString().substring(1, val.toString().length() - 1) : val.toString()]
+    }
+  };
 
   allData.put('context', context);
   allData.put('connected_data', neighbours);
-  allData.put('impacted_data_sources', impactedDataSources);
-  allData.put('impacted_servers', impactedServers);
-  allData.put('impacted_people', impactedPeople);
 
 
+  PontusJ2ReportingFunctions.g = g;
 
-  com.hubspot.jinjava.Jinjava jinJava = new com.hubspot.jinjava.Jinjava();
-  return jinJava.render(new String(pg_templateTextInBase64.decodeBase64()), allData).bytes.encodeBase64().toString();
+  if ('Event.Data_Breach' == vertType) {
+    def impactedServers = g.V(pg_id)
+      .both()
+      .has("Metadata.Type.Object.AWS_Instance", P.eq('Object.AWS_Instance'))
+      .valueMap().toList().collect { item ->
+      item.collectEntries { key, val ->
+        [key.replaceAll('[.]', '_'), val.toString().substring(1, val.toString().length() - 1)]
+      }
+    };
+
+    GraphTraversal impactedDataSourcesTrav = g.V(pg_id)
+      .both().has("Metadata.Type.Object.AWS_Instance", P.eq('Object.AWS_Instance'))
+      .bothE('Runs_On').outV().dedup()
+
+    GraphTraversal dsTravClone = impactedDataSourcesTrav.clone()
+
+    def impactedDataSources = impactedDataSourcesTrav.valueMap().toList().collect { item ->
+      item.collectEntries { key, val ->
+        [key.replaceAll('[.]', '_'), val.toString().substring(1, val.toString().length() - 1)]
+      }
+    };
+    def impactedPeople = dsTravClone
+      .out("Has_Ingestion_Event")
+      .out("Has_Ingestion_Event")
+      .in("Has_Ingestion_Event")
+      .has("Metadata.Type.Person.Natural", P.eq('Person.Natural'))
+      .dedup()
+      .valueMap()
+      .toList()
+      .collect { item ->
+        item.collectEntries { key, val ->
+          [key.replaceAll('[.]', '_'), val.toString().substring(1, val.toString().length() - 1)]
+        }
+      };
+    allData.put('impacted_data_sources', impactedDataSources);
+    allData.put('impacted_servers', impactedServers);
+    allData.put('impacted_people', impactedPeople);
+
+  }
+
+
+  return PontusJ2ReportingFunctions.jinJava.render(new String(pg_templateTextInBase64.decodeBase64()), allData).bytes.encodeBase64().toString();
 
 }
 //def getVisJsGraphImmediateNeighbourNodes(long pg_vid, StringBuffer sb, int counter, Set <Long> nodeIds,AtomicInteger depth) {
@@ -1137,7 +1626,7 @@ def getVisJsGraphImmediateNeighbourNodes(long pg_vid, StringBuffer sb, int count
 }
 
 
-def getEdgeProperties (long fromVertexId, long toVertexId){
+def getEdgeProperties(long fromVertexId, long toVertexId) {
   def mapper = GraphSONMapper.build().version(GraphSONVersion.V1_0).create().createMapper();
 
   def v = g.V(fromVertexId).bothE().filter(bothV().id().is(toVertexId)).valueMap().next()
@@ -1147,8 +1636,7 @@ def getEdgeProperties (long fromVertexId, long toVertexId){
 }
 
 
-def getVisJSGraph(long pg_vid, long pg_depth)
-{
+def getVisJSGraph(long pg_vid, long pg_depth) {
 //g.V().has("Metadata.Type.Person.Natural",eq("Person.Natural")).id()
 //g.V(1720320).bothE()
 //1720320
@@ -1160,9 +1648,9 @@ def getVisJSGraph(long pg_vid, long pg_depth)
   StringBuffer sb2 = new StringBuffer()
 
   Long numEdges = g.V(pg_vid).bothE().count().next();
-  String origLabel = g.V(pg_vid).label().next().replaceAll('[_.]',' ');
+  String origLabel = g.V(pg_vid).label().next().replaceAll('[_.]', ' ');
 
-  if (numEdges > 15){
+  if (numEdges > 15) {
 
     HashSet nodesSet = new HashSet()
     HashSet edgesSet = new HashSet()
@@ -1172,27 +1660,27 @@ def getVisJSGraph(long pg_vid, long pg_depth)
       .outE().match(
       __.as('e').inV().label().as('vLabel')
       // ,  __.as('e').outV().label().as('inVLabel')
-      ,  __.as('e').label().as('edgeLabel')
+      , __.as('e').label().as('edgeLabel')
     )
-      .select( 'edgeLabel','vLabel')
-      .groupCount().each{
+      .select('edgeLabel', 'vLabel')
+      .groupCount().each {
       def entry = it;
 
 
 
-      entry.each{
-        key,val ->
+      entry.each {
+        key, val ->
 
 
-          if (key instanceof Map){
+          if (key instanceof Map) {
 
-            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]',' ');
-            String toNodeLabel = key.get('vLabel').replaceAll('[_.]',' ') +
-              ' -> (' + edgeLabel +')';
+            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]', ' ');
+            String toNodeLabel = key.get('vLabel').replaceAll('[_.]', ' ') +
+              ' -> (' + edgeLabel + ')';
 
             String edgeId = key.get('edgeLabel');
             String toNodeId = key.get('vLabel') +
-              ' -> (' + edgeId +')';
+              ' -> (' + edgeId + ')';
 
             sb.setLength(0);
 
@@ -1203,7 +1691,7 @@ def getVisJSGraph(long pg_vid, long pg_depth)
               .append('"}\n')
 
 
-            nodesSet.add( sb.toString() );
+            nodesSet.add(sb.toString());
 
 
             sb.setLength(0);
@@ -1215,41 +1703,38 @@ def getVisJSGraph(long pg_vid, long pg_depth)
               .append(val).append(')","value":')
               .append(val).append('}\n')
 
-            edgesSet.add (sb.toString());
+            edgesSet.add(sb.toString());
             sb.setLength(0);
 
           }
 
 
-
       }
 
 
-
     }
-
 
 
     g.V(pg_vid).as('orig')
       .inE().match(
       __.as('e').outV().label().as('vLabel')
       // ,  __.as('e').outV().label().as('inVLabel')
-      ,  __.as('e').label().as('edgeLabel')
+      , __.as('e').label().as('edgeLabel')
     )
-      .select( 'edgeLabel','vLabel')
-      .groupCount().each{
-      it.each{
-        key,val ->
-          if (key instanceof Map){
+      .select('edgeLabel', 'vLabel')
+      .groupCount().each {
+      it.each {
+        key, val ->
+          if (key instanceof Map) {
 
-            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]',' ');
+            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]', ' ');
 
-            String fromNodeLabel = key.get('vLabel').replaceAll('[_.]',' ') +
-              ' <- ('+edgeLabel+')';
+            String fromNodeLabel = key.get('vLabel').replaceAll('[_.]', ' ') +
+              ' <- (' + edgeLabel + ')';
             String edgeId = key.get('edgeLabel');
 
-            String fromNodeId = key.get('vLabel')+
-              ' <- ('+edgeId+')';
+            String fromNodeId = key.get('vLabel') +
+              ' <- (' + edgeId + ')';
             sb.setLength(0);
 
             sb.append('{ "id":"').append(fromNodeId)
@@ -1258,7 +1743,7 @@ def getVisJSGraph(long pg_vid, long pg_depth)
               .append('","shape":"').append('box')
               .append('"}')
 
-            nodesSet.add( sb.toString() );
+            nodesSet.add(sb.toString());
 
 
             sb.setLength(0);
@@ -1269,14 +1754,12 @@ def getVisJSGraph(long pg_vid, long pg_depth)
               .append(edgeLabel).append(' (')
               .append(val).append(')","value":')
               .append(val).append('}')
-            edgesSet.add (sb.toString());
+            edgesSet.add(sb.toString());
             sb.setLength(0);
           }
 
 
-
       }
-
 
 
     }
@@ -1286,37 +1769,36 @@ def getVisJSGraph(long pg_vid, long pg_depth)
       .append('","group":"').append(origLabel)
       .append('","fixed":').append(true)
       .append(',"shape":"').append('image')
-      .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g,pg_vid,origLabel).toString())
+      .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g, pg_vid, origLabel).toString())
       .append('"}')
 
-    nodesSet.add( sb.toString() )
+    nodesSet.add(sb.toString())
     sb.setLength(0)
 
-    sb.append('{ "nodes":' )
+    sb.append('{ "nodes":')
       .append(nodesSet.toString()).append(', "edges":').append(edgesSet.toString())
-  }
-  else{
+  } else {
     int counter = 0;
 
     try {
 
-      sb.append('{ "nodes":[' );
+      sb.append('{ "nodes":[');
 
       g.V(pg_vid)
         .both()
         .dedup()
-        .each{
+        .each {
           String groupStr = it.values('Metadata.Type').next();
-          String labelStr = it.label().toString().replaceAll('[_.]',' ');
+          String labelStr = it.label().toString().replaceAll('[_.]', ' ');
           Long vid = it.id();
-          sb.append(counter == 0? '{':',{')
+          sb.append(counter == 0 ? '{' : ',{')
             .append('"id":').append(vid)
             .append(',"group":"').append(groupStr)
             .append('","label":"').append(labelStr)
             .append('","shape":"').append('image')
-            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g,vid,labelStr).toString())
+            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g, vid, labelStr).toString())
             .append('"');
-          if (vid.equals( pg_vid)){
+          if (vid.equals(pg_vid)) {
             sb.append(',"fixed":true');
           }
           sb.append('}')
@@ -1325,18 +1807,18 @@ def getVisJSGraph(long pg_vid, long pg_depth)
 
         };
       g.V(pg_vid)  // Also get the original node
-        .each{
+        .each {
           String groupStr = it.values('Metadata.Type').next();
-          String labelStr = it.label().toString().replaceAll('[_.]',' ');
+          String labelStr = it.label().toString().replaceAll('[_.]', ' ');
           Long vid = it.id();
-          sb.append(counter == 0? '{':',{')
+          sb.append(counter == 0 ? '{' : ',{')
             .append('"id":').append(vid)
             .append(',"group":"').append(groupStr)
             .append('","label":"').append(labelStr)
             .append('","shape":"').append('image')
-            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g,vid,labelStr).toString())
+            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g, vid, labelStr).toString())
             .append('"');
-          if (vid.equals( pg_vid)){
+          if (vid.equals(pg_vid)) {
             sb.append(',"fixed":true');
           }
           sb.append('}')
@@ -1344,35 +1826,45 @@ def getVisJSGraph(long pg_vid, long pg_depth)
           counter++;
 
         };
-      sb.append('], "edges":[' )
+      sb.append('], "edges":[')
+
+
+      StringBuffer prob = new StringBuffer();
+      try {
+        prob.append(' - s - ')
+          .append(
+            Math.round(
+              Math.min(
+                it.values('toScorePercent').next(),
+                it.values('fromScorePercent').next()
+              ) * 100) / 100)
+          .append('%')
+
+      } catch (Throwable t) {
+        prob.setLength(0)
+      }
 
 
       counter = 0;
       g.V(pg_vid)
         .bothE()
         .dedup()
-        .each{
-          sb.append(counter == 0? '{':',{')
+        .each {
+          sb.append(counter == 0 ? '{' : ',{')
             .append('"from": ').append(it.inVertex().id())
             .append(' ,"to": "').append(it.outVertex().id())
-            .append('","label": "').append(it.label().toString().replaceAll('[_.]',' '))
-            .append(',\n prob:')
-            .append(
-              Math.round(
-                Math.min(
-                  it.values('toScorePercent').next(),
-                  it.values('fromScorePercent').next()
-                ) * 100) / 100 )
-            .append('%"}')
+            .append('","label": "').append(it.label().toString().replaceAll('[_.]', ' '))
+            .append(prob.toString())
+            .append('"}')
 
           counter++;
 
         }
 
-      sb.append(']' );
+      sb.append(']');
 
 
-    }catch (Throwable t){
+    } catch (Throwable t) {
       sb.append(t.toString());
     }
 
@@ -1380,14 +1872,14 @@ def getVisJSGraph(long pg_vid, long pg_depth)
   sb.append(', "origLabel":"').append(origLabel).append('"');
   int counter = 0;
   sb.append(', "reportButtons": [');
-  try{
+  try {
     g.V()
       .has('Object.Notification_Templates.Types'
-        ,eq(g.V(pg_vid).values('Metadata.Type').next()))
-      .valueMap('Object.Notification_Templates.Label','Object.Notification_Templates.Text')
-      .each{
-        sb.append(counter > 0? ',{': '{');
-        counter ++;
+        , eq(g.V(pg_vid).values('Metadata.Type').next()))
+      .valueMap('Object.Notification_Templates.Label', 'Object.Notification_Templates.Text')
+      .each {
+        sb.append(counter > 0 ? ',{' : '{');
+        counter++;
         sb.append('"text":"');
         if (it.get('Object.Notification_Templates.Text') != null)
           sb.append(it.get('Object.Notification_Templates.Text')[0].toString());
@@ -1399,7 +1891,8 @@ def getVisJSGraph(long pg_vid, long pg_depth)
         sb.append("}")
 
       }
-  } catch(e) {}
+  } catch (e) {
+  }
   sb.append('] }');
   sb.toString()
 }
@@ -1547,15 +2040,15 @@ def getLevel(String label) {
 }
 
 
-def getVisJsGraph(long pg_vid){
+def getVisJsGraph(long pg_vid) {
 
 
   StringBuffer sb = new StringBuffer()
 
   Long numEdges = g.V(pg_vid).bothE().count().next();
-  String origLabel = g.V(pg_vid).label().next().replaceAll('[_.]',' ');
+  String origLabel = g.V(pg_vid).label().next().replaceAll('[_.]', ' ');
 
-  if (numEdges > 15){
+  if (numEdges > 15) {
 
     HashSet nodesSet = new HashSet()
     HashSet edgesSet = new HashSet()
@@ -1565,27 +2058,27 @@ def getVisJsGraph(long pg_vid){
       .outE().match(
       __.as('e').inV().label().as('vLabel')
       // ,  __.as('e').outV().label().as('inVLabel')
-      ,  __.as('e').label().as('edgeLabel')
+      , __.as('e').label().as('edgeLabel')
     )
-      .select( 'edgeLabel','vLabel')
-      .groupCount().each{
+      .select('edgeLabel', 'vLabel')
+      .groupCount().each {
       def entry = it;
 
 
 
-      entry.each{
-        key,val ->
+      entry.each {
+        key, val ->
 
 
-          if (key instanceof Map){
+          if (key instanceof Map) {
 
-            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]',' ');
-            String toNodeLabel = key.get('vLabel').replaceAll('[_.]',' ') +
-              ' -> (' + edgeLabel +')';
+            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]', ' ');
+            String toNodeLabel = key.get('vLabel').replaceAll('[_.]', ' ') +
+              ' -> (' + edgeLabel + ')';
 
             String edgeId = key.get('edgeLabel');
             String toNodeId = key.get('vLabel') +
-              ' -> (' + edgeId +')';
+              ' -> (' + edgeId + ')';
 
             sb.setLength(0);
 
@@ -1596,7 +2089,7 @@ def getVisJsGraph(long pg_vid){
               .append('"}\n')
 
 
-            nodesSet.add( sb.toString() );
+            nodesSet.add(sb.toString());
 
 
             sb.setLength(0);
@@ -1608,41 +2101,38 @@ def getVisJsGraph(long pg_vid){
               .append(val).append(')","value":')
               .append(val).append('}\n')
 
-            edgesSet.add (sb.toString());
+            edgesSet.add(sb.toString());
             sb.setLength(0);
 
           }
 
 
-
       }
 
 
-
     }
-
 
 
     g.V(pg_vid).as('orig')
       .inE().match(
       __.as('e').outV().label().as('vLabel')
       // ,  __.as('e').outV().label().as('inVLabel')
-      ,  __.as('e').label().as('edgeLabel')
+      , __.as('e').label().as('edgeLabel')
     )
-      .select( 'edgeLabel','vLabel')
-      .groupCount().each{
-      it.each{
-        key,val ->
-          if (key instanceof Map){
+      .select('edgeLabel', 'vLabel')
+      .groupCount().each {
+      it.each {
+        key, val ->
+          if (key instanceof Map) {
 
-            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]',' ');
+            String edgeLabel = key.get('edgeLabel').replaceAll('[_.]', ' ');
 
-            String fromNodeLabel = key.get('vLabel').replaceAll('[_.]',' ') +
-              ' <- ('+edgeLabel+')';
+            String fromNodeLabel = key.get('vLabel').replaceAll('[_.]', ' ') +
+              ' <- (' + edgeLabel + ')';
             String edgeId = key.get('edgeLabel');
 
-            String fromNodeId = key.get('vLabel')+
-              ' <- ('+edgeId+')';
+            String fromNodeId = key.get('vLabel') +
+              ' <- (' + edgeId + ')';
             sb.setLength(0);
 
             sb.append('{ "id":"').append(fromNodeId)
@@ -1651,7 +2141,7 @@ def getVisJsGraph(long pg_vid){
               .append('","shape":"').append('box')
               .append('"}')
 
-            nodesSet.add( sb.toString() );
+            nodesSet.add(sb.toString());
 
 
             sb.setLength(0);
@@ -1662,14 +2152,12 @@ def getVisJsGraph(long pg_vid){
               .append(edgeLabel).append(' (')
               .append(val).append(')","value":')
               .append(val).append('}')
-            edgesSet.add (sb.toString());
+            edgesSet.add(sb.toString());
             sb.setLength(0);
           }
 
 
-
       }
-
 
 
     }
@@ -1679,37 +2167,36 @@ def getVisJsGraph(long pg_vid){
       .append('","group":"').append(origLabel)
       .append('","fixed":').append(true)
       .append(',"shape":"').append('image')
-      .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g,pg_vid,origLabel).toString())
+      .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g, pg_vid, origLabel).toString())
       .append('"}')
 
-    nodesSet.add( sb.toString() )
+    nodesSet.add(sb.toString())
     sb.setLength(0)
 
-    sb.append('{ "nodes":' )
+    sb.append('{ "nodes":')
       .append(nodesSet.toString()).append(', "edges":').append(edgesSet.toString())
-  }
-  else{
+  } else {
     int counter = 0;
 
     try {
 
-      sb.append('{ "nodes":[' );
+      sb.append('{ "nodes":[');
 
       g.V(pg_vid)
         .both()
         .dedup()
-        .each{
+        .each {
           String groupStr = it.values('Metadata.Type').next();
-          String labelStr = it.label().toString().replaceAll('[_.]',' ');
+          String labelStr = it.label().toString().replaceAll('[_.]', ' ');
           Long vid = it.id();
-          sb.append(counter == 0? '{':',{')
+          sb.append(counter == 0 ? '{' : ',{')
             .append('"id":').append(vid)
             .append(',"group":"').append(groupStr)
             .append('","label":"').append(labelStr)
             .append('","shape":"').append('image')
-            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g,vid,labelStr).toString())
+            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g, vid, labelStr).toString())
             .append('"');
-          if (vid.equals( pg_vid)){
+          if (vid.equals(pg_vid)) {
             sb.append(',"fixed":true');
           }
           sb.append('}')
@@ -1718,18 +2205,18 @@ def getVisJsGraph(long pg_vid){
 
         };
       g.V(pg_vid)  // Also get the original node
-        .each{
+        .each {
           String groupStr = it.values('Metadata.Type').next();
-          String labelStr = it.label().toString().replaceAll('[_.]',' ');
+          String labelStr = it.label().toString().replaceAll('[_.]', ' ');
           Long vid = it.id();
-          sb.append(counter == 0? '{':',{')
+          sb.append(counter == 0 ? '{' : ',{')
             .append('"id":').append(vid)
             .append(',"group":"').append(groupStr)
             .append('","label":"').append(labelStr)
             .append('","shape":"').append('image')
-            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g,vid,labelStr).toString())
+            .append('","image":"').append(getPropsNonMetadataAsHTMLTableRows(g, vid, labelStr).toString())
             .append('"');
-          if (vid.equals( pg_vid)){
+          if (vid.equals(pg_vid)) {
             sb.append(',"fixed":true');
           }
           sb.append('}')
@@ -1737,35 +2224,43 @@ def getVisJsGraph(long pg_vid){
           counter++;
 
         };
-      sb.append('], "edges":[' )
+      sb.append('], "edges":[')
 
+      StringBuffer prob = new StringBuffer();
+      try {
+        prob.append(' - s - ')
+          .append(
+            Math.round(
+              Math.min(
+                it.values('toScorePercent').next(),
+                it.values('fromScorePercent').next()
+              ) * 100) / 100)
+          .append('%')
+
+      } catch (Throwable t) {
+        prob.setLength(0)
+      }
 
       counter = 0;
       g.V(pg_vid)
         .bothE()
         .dedup()
-        .each{
-          sb.append(counter == 0? '{':',{')
+        .each {
+          sb.append(counter == 0 ? '{' : ',{')
             .append('"from": ').append(it.inVertex().id())
             .append(' ,"to": "').append(it.outVertex().id())
-            .append('","label": "').append(it.label().toString().replaceAll('[_.]',' '))
-            .append(',\n prob:')
-            .append(
-              Math.round(
-                Math.min(
-                  it.values('toScorePercent').next(),
-                  it.values('fromScorePercent').next()
-                ) * 100) / 100 )
-            .append('%"}')
+            .append('","label": "').append(it.label().toString().replaceAll('[_.]', ' '))
+            .append(prob.toString())
+            .append('"}')
 
           counter++;
 
         }
 
-      sb.append(']' );
+      sb.append(']');
 
 
-    }catch (Throwable t){
+    } catch (Throwable t) {
       sb.append(t.toString());
     }
 
@@ -1773,14 +2268,14 @@ def getVisJsGraph(long pg_vid){
   sb.append(', "origLabel":"').append(origLabel).append('"');
   int counter = 0;
   sb.append(', "reportButtons": [');
-  try{
+  try {
     g.V()
       .has('Object.Notification_Templates.Types'
-        ,eq(g.V(pg_vid).values('Metadata.Type').next()))
-      .valueMap('Object.Notification_Templates.Label','Object.Notification_Templates.Text')
-      .each{
-        sb.append(counter > 0? ',{': '{');
-        counter ++;
+        , eq(g.V(pg_vid).values('Metadata.Type').next()))
+      .valueMap('Object.Notification_Templates.Label', 'Object.Notification_Templates.Text')
+      .each {
+        sb.append(counter > 0 ? ',{' : '{');
+        counter++;
         sb.append('"text":"');
         if (it.get('Object.Notification_Templates.Text') != null)
           sb.append(it.get('Object.Notification_Templates.Text')[0].toString());
@@ -1792,7 +2287,8 @@ def getVisJsGraph(long pg_vid){
         sb.append("}")
 
       }
-  } catch(e) {}
+  } catch (e) {
+  }
   sb.append('] }');
   return sb.toString()
 }
